@@ -15,12 +15,14 @@ def _clean_dir(dirname):
 
 @pytest.fixture(scope='session', autouse=True)
 def configure_html_report_env(request):
+    if not hasattr(request.config, '_metadata'):
+        return
     keep_items = ['BUILD_', 'GIT_', 'JENKINS', 'JOB_NAME', 'NODE_NAME']
     for key in list(request.config._metadata.keys()):
-      remove = True
-      for allowed_string in keep_items:
-        if allowed_string in key:
-          remove = False
-          break
-      if remove:
-        del request.config._metadata[key]
+        remove = True
+        for allowed_string in keep_items:
+            if allowed_string in key:
+                remove = False
+                break
+        if remove:
+            del request.config._metadata[key]

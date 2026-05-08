@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+################################################################
+#
+# ase2force:
+#   convert VASP output data into potfit reference configurations
+#
+################################################################
+#
+#   Copyright 2002-2026 - the potfit development team
+#
+#   https://www.potfit.net/
+#
+#################################################################
+#
+#   This file is part of potfit.
+#
+#   potfit is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   potfit is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with potfit; if not, see <http://www.gnu.org/licenses/>.
+#
+#################################################################
+
+import argparse
+import io
+import gzip
+import os
+import sys
+from collections import OrderedDict
+
+try:
+    from ase.io.vasp import iread_vasp_out
+except ImportError:
+    sys.stderr.write(
+        'Error: ase2force requires the ASE Python package.\n'
+        'Install it with `pip install ase` or your package manager, then retry.\n'
+    )
+    sys.exit(1)
+
+
+class ConfigData:
+    MajorIteration = 0
+    MinorIteration = 0
+    Energy = 0
+    Box_x = []
+    Box_y = []
+    Box_z = []
+    Stress = []
+    AtomData = []
+
+    @staticmethod
+    def Reset():
+        ConfigData.Energy = 0
+        ConfigData.Box_x = []
+        ConfigData.Box_y = []
+        ConfigData.Box_z = []
+        ConfigData.Stress = []
+        ConfigData.AtomData = []
+
+
+class ase_config(object):
+    """VASP configuration holder class backed by ASE."""
+
+    max_types = 0
+    types = OrderedDict()
+    numbers = OrderedDict()
+    elements_provided = False
+    single_atom_energy = []
+
+    def __init__(self, filename):
+        self.filename = filename
+        self.__scan_outcar_file(filename)
+        ase_config.max_types = max(ase_config.max_types, len(self.elements))
+
+    def __scan_outcar_file(self, filename):
+        if filename.endswith('.gz'):
+            f = gzip.open(filename, 'rt')
+        else:
+            f = open(filename, 'r')
+        try:
+            raw_text = f.read()
+        finally:
+            f.close()
+
+        self.stresses = []
+        for line in raw_text.splitlines():
+            if line.lstrip().startswith('in kB'):
+                values = [float(x) / 1602 for x in line.split()[2:8]]
+                if len(values) == 6:
+                    self.stresses.append(values)
+
+        buffer = io.StringIO(raw_text)
+        buffer.name = filename
+        self.configurations = list(iread_vasp_out(buffer, index=':'))
+
+        self.nconfig = len(self.configurations)
+        if self.nconfig == 0:
+            sys.stderr.write('Could not determine any configurations in file %s.\n' % filename)
+            sys.exit()
+
+        first = self.configurations[0]
+        self.elements = uniq(first.get_chemical_symbols())
+        self.natoms = len(first)
+        self.atoms_per_type = [first.get_chemical_symbols().count(symbol) for symbol in self.elements]
+
+    @staticmethod
+    def read_single_atom_energies(sae_file):
+        try:
+            lines = 0
+            for line in open(sae_file, 'r'):
+                lines += 1
+            if lines != 1:
+                sys.stderr.write('Single atom energy file contains more than one line!\n')
+                sys.exit()
+            with open(sae_file, 'r') as f:
+                ase_config.single_atom_energy = [float(x) for x in f.read().split()]
+        except Exception:
+            sys.stderr.write('Error reading single atom energy file!\n')
+            sys.exit()
+
+    def elements_check(self):
+        ase_config.elements_provided = True
+        for element in self.elements:
+            if element not in ase_config.types:
+                sys.stderr.write('ERROR: Undefined element in {} detected: {}\n'.format(self.filename, element))
+                sys.stderr.write('ERROR: Provided element configuration:')
+                for key, value in ase_config.types.items():
+                    sys.stderr.write(' {}={}'.format(key, value))
+                sys.stderr.write('\n')
+                sys.exit()
+
+    def print_list(self):
+        print('File {}'.format(self.filename))
+        print(' number of configurations: {}'.format(self.nconfig))
+        print(' number of atom types: {}'.format(len(self.elements)))
+        print(' order of elements: ', end='')
+        for i in range(len(self.elements)):
+            print('{}={}'.format(self.elements[i], i))
+
+    def set_active_configs(self, configs, final, all):
+        self.configs = []
+        if configs is None and final is False and all is False:
+            sys.stderr.write('ERROR: No configuration(s) given!\n')
+            sys.stderr.write('ERROR: Use the -s, -a or -f arguments to specify configurations\n')
+            sys.exit()
+        if all is True:
+            self.configs = [int(s) + 1 for s in range(self.nconfig)]
+            return
+        if configs:
+            for item in configs.split(','):
+                if not item:
+                    sys.stderr.write('ERROR: Could not read the -s string.\n')
+                    sys.exit()
+                if len(item.split('-')) == 1:
+                    try:
+                        a = int(item)
+                    except Exception:
+                        sys.stderr.write('ERROR: Could not read the -s string ({}).\n'.format(item))
+                        sys.exit()
+                    if a < 1:
+                        sys.stderr.write('ERROR: Configurations start with index 1!\n')
+                        sys.exit()
+                    if a <= self.nconfig:
+                        self.configs.append(a)
+                else:
+                    items = item.split('-')
+                    if len(items) != 2:
+                        sys.stderr.write('ERROR: Could not read the -s string ({}).\n'.format(item))
+                        sys.exit()
+                    try:
+                        val_min = int(items[0])
+                        val_max = int(items[1])
+                    except Exception:
+                        sys.stderr.write('ERROR: Could not read the -s string ({}).\n'.format(item))
+                        sys.exit()
+                    if val_min > val_max:
+                        val_min = val_max
+                        val_max = int(items[0])
+                    if val_min < 1 or val_max > self.nconfig:
+                        sys.stderr.write('ERROR: Range of the -s string invalid ({}).\n'.format(item))
+                        sys.stderr.write('ERROR: {} contains {} configurations.\n'.format(self.filename, self.nconfig))
+                        sys.exit()
+                    for i in range(val_min, val_max + 1):
+                        self.configs.append(i)
+        if final is True:
+            self.configs.append(self.nconfig)
+
+    def __stress_to_potfit(self, config_index):
+        if config_index - 1 >= len(self.stresses):
+            return []
+        return self.stresses[config_index - 1]
+
+    def __write_config_data(self, config_index):
+        atoms = self.configurations[config_index - 1]
+        positions = atoms.get_positions()
+        forces = atoms.get_forces()
+        stress = self.__stress_to_potfit(config_index)
+        symbols = atoms.get_chemical_symbols()
+
+        print('#N {} 1'.format(self.natoms))
+        print('#C {}'.format(' '.join(self.elements)))
+        print('## force file generated from file {} config {}'.format(self.filename, config_index))
+        cell = atoms.cell.array
+        print('#X {:13.8f} {:13.8f} {:13.8f}'.format(cell[0][0], cell[0][1], cell[0][2]))
+        print('#Y {:13.8f} {:13.8f} {:13.8f}'.format(cell[1][0], cell[1][1], cell[1][2]))
+        print('#Z {:13.8f} {:13.8f} {:13.8f}'.format(cell[2][0], cell[2][1], cell[2][2]))
+        print('#W {:f}'.format(args.weight))
+
+        energy = atoms.get_potential_energy()
+        if len(ase_config.single_atom_energy) > 0:
+            if len(ase_config.single_atom_energy) < len(self.atoms_per_type):
+                sys.stderr.write('Invalid number of items in single atom energy file.\n')
+                sys.stderr.write('Expected {} but found {}.\n'.format(len(self.atoms_per_type), len(ase_config.single_atom_energy)))
+                sys.exit()
+            for i in range(len(self.atoms_per_type)):
+                energy -= self.atoms_per_type[i] * ase_config.single_atom_energy[i]
+        print('#E {:.10f}'.format(energy / self.natoms))
+        if stress:
+            print('#S', end='')
+            for num in range(6):
+                sys.stdout.write(' {:8.7g}'.format(stress[num]))
+            sys.stdout.write('\n')
+        print('#F')
+        for index, symbol in enumerate(symbols):
+            if ase_config.elements_provided:
+                type_index = int(ase_config.types[symbol])
+            else:
+                if symbol not in ase_config.types:
+                    new_index = len(ase_config.types)
+                    ase_config.types[symbol] = new_index
+                    ase_config.numbers[new_index] = symbol
+                    type_index = new_index
+                else:
+                    type_index = ase_config.types[symbol]
+            print('{} {:11.7g} {:11.7g} {:11.7g} {:11.7g} {:11.7g} {:11.7g}'.format(
+                type_index,
+                positions[index][0],
+                positions[index][1],
+                positions[index][2],
+                forces[index][0],
+                forces[index][1],
+                forces[index][2],
+            ))
+
+    def print_configs(self):
+        for config_index in self.configs:
+            ConfigData.Reset()
+            self.__write_config_data(config_index)
+
+    def print_debug(self):
+        print('My name is {}'.format(self.filename))
+        print('I contain {} valid configs.'.format(self.nconfig))
+        print('Elements are {} with {} atoms'.format(self.elements, self.atoms_per_type))
+        print('Active configs: {}'.format(self.configs))
+
+
+def uniq(seq):
+    seen = set()
+    seen_add = seen.add
+    return [x for x in seq if x not in seen and not seen_add(x)]
+
+
+def get_outcar_files(directory, recursive):
+    sys.stderr.write('Searching directory %s for OUTCAR* files ...\n' % directory)
+    outcars = []
+    if not recursive:
+        for item in os.listdir(directory):
+            if item.startswith('OUTCAR'):
+                outcars.append(os.path.join(directory, item))
+    else:
+        for root, subfolders, files in os.walk(directory):
+            for item in files:
+                if item.startswith('OUTCAR'):
+                    outcars.append(os.path.join(root, item))
+    if len(outcars) == 0:
+        sys.stderr.write('Could not find any OUTCAR files in this directory.\n')
+        sys.exit()
+    else:
+        sys.stderr.write('Found the following files:\n')
+        sys.stderr.write('  {}\n'.format(('\n  ').join(outcars)))
+    return outcars
+
+
+def check_for_vasp_tag(filename):
+    if filename.endswith('.gz'):
+        try:
+            f = gzip.open(filename, 'rt')
+        except Exception:
+            return False
+    else:
+        try:
+            f = open(filename, 'r')
+        except Exception:
+            return False
+    found_vasp_tag = False
+    line = f.readline()
+    if 'vasp' in line or 'VASP' in line:
+        found_vasp_tag = True
+    f.close()
+    return found_vasp_tag
+
+
+class SmartFormatter(argparse.HelpFormatter):
+    def _split_lines(self, text, width):
+        if text.startswith('R|'):
+            return text[2:].splitlines()
+        return argparse.HelpFormatter._split_lines(self, text, width)
+
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+        description='''Converts VASP output data into potfit reference configurations.''',
+        formatter_class=SmartFormatter,
+    )
+    parser.add_argument('-c', type=str, required=False, help='R|list of indices for chemical elements to use\ne.g. -c Mg=0,Zn=1', metavar='<elem_list>')
+    parser.add_argument('-e', type=str, required=False, help='file with single atom energies', metavar='<sae_file>')
+    parser.add_argument('-a', '--all', action='store_true', help='use all configurations from OUTCAR')
+    parser.add_argument('-f', '--final', action='store_true', help='use only the final configuration from OUTCAR')
+    parser.add_argument('-l', '--list', action='store_true', help='list OUTCAR properties and exit')
+    parser.add_argument('-r', '--recursive', action='store_true', help='scan recursively for OUTCAR files')
+    parser.add_argument('-s', '--configs', type=str, help='R|comma separated list of configurations to use\n'
+                        'supported schemes:\n'
+                        ' -s 1,4,12         use configs 1, 4 and 12\n'
+                        ' -s 1,6-9          use configs 1, 6, 7, 8 and 9\n'
+                        ' -s 1,4,6-9,12     combination of the above')
+    parser.add_argument('-w', '--weight', type=float, default=1.0, help='configuration weight for all configurations')
+    parser.add_argument('files', type=str, nargs='*', help='R|list of OUTCAR files (plain or gzipped)\n(directory in case of -r option)')
+    return parser.parse_args()
+
+
+def check_command_line_args(args):
+    if args.weight < 0:
+        sys.stderr.write('The weight needs to be positive!\n')
+        sys.exit()
+
+
+def generate_outcar_list(file_list):
+    outcars = []
+    if not file_list:
+        outcars = get_outcar_files('.', args.recursive)
+    else:
+        for item in file_list:
+            if os.path.isdir(item):
+                outcars += get_outcar_files(item, args.recursive)
+            elif os.path.isfile(item):
+                outcars.append(os.path.abspath(item))
+            else:
+                sys.stderr.write('File {} does not exists, removing from file list!\n'.format(item))
+    return uniq(outcars)
+
+
+if __name__ == '__main__':
+    args = parse_command_line()
+    check_command_line_args(args)
+    if args.e:
+        ase_config.read_single_atom_energies(args.e)
+    outcar_list = generate_outcar_list(args.files)
+
+    config_list = []
+    for outcar_file in outcar_list:
+        if not check_for_vasp_tag(outcar_file):
+            sys.stderr.write('No VASP data found in file {}, removing from list\n'.format(outcar_file))
+            continue
+        try:
+            config_list.append(ase_config(outcar_file))
+        except Exception:
+            pass
+    if len(config_list) == 0:
+        sys.stderr.write('No valid OUTCAR files!\n')
+        sys.exit()
+
+    if args.list:
+        print(' --- Listing configuration data for OUTCAR files --- ')
+        for config in config_list:
+            config.print_list()
+        sys.exit()
+
+    if args.c:
+        for item in args.c.split(','):
+            if len(item.split('=')) != 2:
+                sys.stderr.write('ERROR: Could not read the -c string.\n')
+                sys.stderr.write('ERROR: Maybe a missing or extra \'=\' sign?\n')
+                sys.exit()
+            try:
+                name = str(item.split('=')[0])
+                number = int(item.split('=')[1])
+            except Exception:
+                sys.stderr.write('ERROR: Could not read the -c string (error in: {})\n'.format(item))
+                sys.exit()
+            if name in ase_config.types:
+                sys.stderr.write('ERROR: Duplicate atom type found in -c string\n')
+                sys.stderr.write('ERROR: {} is already assigned to atom type {}\n'.format(name, ase_config.types[name]))
+                sys.exit()
+            if number in ase_config.numbers:
+                sys.stderr.write('ERROR: Duplicate atom number found in -c string\n')
+                sys.stderr.write('ERROR: {} is already assigned to element {}\n'.format(number, ase_config.numbers[number]))
+                sys.exit()
+            ase_config.types[name] = number
+            ase_config.numbers[number] = name
+        for config in config_list:
+            config.elements_check()
+
+    for config in config_list:
+        config.set_active_configs(args.configs, args.final, args.all)
+
+    for config in config_list:
+        config.print_configs()
