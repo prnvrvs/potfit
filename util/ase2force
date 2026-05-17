@@ -99,12 +99,16 @@ class ase_config(object):
 
         buffer = io.StringIO(raw_text)
         buffer.name = filename
-        self.configurations = list(iread_vasp_out(buffer, index=':'))
+        try:
+            self.configurations = list(iread_vasp_out(buffer, index=':'))
+        except Exception:
+            sys.stderr.write('Error: ASE format not supported for file {}.\n'.format(filename))
+            sys.exit(1)
 
         self.nconfig = len(self.configurations)
         if self.nconfig == 0:
-            sys.stderr.write('Could not determine any configurations in file %s.\n' % filename)
-            sys.exit()
+            sys.stderr.write('Error: ASE format not supported for file {}.\n'.format(filename))
+            sys.exit(1)
 
         first = self.configurations[0]
         self.elements = uniq(first.get_chemical_symbols())
